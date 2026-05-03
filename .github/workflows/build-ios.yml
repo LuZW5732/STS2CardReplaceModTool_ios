@@ -1,0 +1,84 @@
+name: Build iOS IPA (Sideload Ready)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Unsigned IPA
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+          cache-dependency-path: Sts2ModPacker/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          cd Sts2ModPacker
+          npm install
+
+      - name: Prebuild iOS project
+        run: |
+          cd Sts2ModPacker
+          npx expo prebuild --platform ios --no-install
+
+      - name: Install CocoaPods
+        run: |
+          cd Sts2ModPacker/ios
+          pod install
+
+      - name: Build Unsigned App
+        run: |
+          cd Sts2ModPacker/ios
+          # Debug: list generated files
+          ls -F
+          
+          # Auto-detect Workspace and Scheme
+          WORKSPACE=$(ls -d *.xcworkspace | head -n 1)
+          SCHEME=$(ls -d *.xcodeproj | sed 's/\.xcodeproj//' | head -n 1)
+          
+          echo "Found Workspace: $WORKSPACE"
+          echo "Found Scheme: $SCHEME"
+          
+          xcodebuild -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            clean build
+
+      - name: Package IPA
+        run: |
+          # The .app usually ends up in build/Build/Products/Release-iphoneos/
+          APP_PATH=$(find Sts2ModPacker/ios/build -name "*.app" -type d | head -n 1)
+          
+          if [ -z "$APP_PATH" ]; then
+            echo "Error: Could not find .app file!"
+            exit 1
+          fi
+          
+          echo "Found App at: $APP_PATH"
+          
+          mkdir -p Payload
+          cp -r "$APP_PATH" Payload/
+          zip -r CardPacker_Sideload.ipa Payload
+          
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CardPacker-Unsigned-IPA
+          path: CardPacker_Sideload.ipa
+          retention-days: 7
