@@ -16,3 +16,5 @@ Slay The Spire 2 Card Replace Mod Tool for iOS
 
 另一种方法是使用LiveContainer，令我的STS2mod.dylib插件注入到游戏中，使其能够在外置的Documents目录下读取mods文件夹及其内容。
 
+
+这是个纯ai项目，主要是因为懒。
