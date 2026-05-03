@@ -18,3 +18,6 @@ Slay The Spire 2 Card Replace Mod Tool for iOS
 
 
 这是个纯ai项目，主要是因为懒。
+
+## 开源协议
+本项目采用 [MIT License](LICENSE) 开源协议。
