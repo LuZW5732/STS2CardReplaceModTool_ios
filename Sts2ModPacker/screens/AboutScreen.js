@@ -16,7 +16,7 @@ export default function AboutScreen() {
         />
         
         <Text style={styles.appName}>CardPacker</Text>
-        <Text style={styles.version}>V3.0</Text>
+        <Text style={styles.version}>V4.0</Text>
         
         <View style={styles.card}>
           <View style={styles.row}>

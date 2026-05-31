@@ -11,7 +11,7 @@ function norm(s) {
 }
 
 function extractKey(filename) {
-  let s = filename.replace(/\.[^/.]+$/, ''); // remove extension
+  let s = filename.replace(/\.[^/.]+$/, '');
   for (const prefix of ['MegaCrit.Sts2.Core.Models.Cards.', 'MegaCrit.', 'STS2.']) {
     if (s.startsWith(prefix)) { s = s.substring(prefix.length); break; }
   }
@@ -26,17 +26,26 @@ export default function CropperModal({ visible, image, onClose, onSave }) {
   const [search, setSearch] = useState('');
   const [selectedCard, setSelectedCard] = useState(null);
   const [atlasExists, setAtlasExists] = useState(false);
+  const [atlasDims, setAtlasDims] = useState(null);
 
   const selectedCardRef = useRef(null);
   useEffect(() => { selectedCardRef.current = selectedCard; }, [selectedCard]);
 
-  // Check atlas file existence when selectedCard changes
+  // Check atlas file existence + get real dimensions when selectedCard changes
   useEffect(() => {
     if (selectedCard?.atlas) {
       const atlasPath = FileSystem.documentDirectory + 'root/' + selectedCard.atlas;
-      FileSystem.getInfoAsync(atlasPath).then(info => setAtlasExists(info.exists)).catch(() => setAtlasExists(false));
+      FileSystem.getInfoAsync(atlasPath).then(info => {
+        setAtlasExists(info.exists);
+        if (info.exists) {
+          Image.getSize(atlasPath, (w, h) => setAtlasDims({ w, h }), () => setAtlasDims(null));
+        } else {
+          setAtlasDims(null);
+        }
+      }).catch(() => { setAtlasExists(false); setAtlasDims(null); });
     } else {
       setAtlasExists(false);
+      setAtlasDims(null);
     }
   }, [selectedCard]);
 
@@ -46,8 +55,6 @@ export default function CropperModal({ visible, image, onClose, onSave }) {
       const key = extractKey(image.name);
       if (key) {
         setSearch(key);
-
-        // Fuzzy match: normalized template name contained within normalized filename key
         const nKey = norm(key);
         let bestMatch = null;
         for (const c of cardsData) {
@@ -58,11 +65,7 @@ export default function CropperModal({ visible, image, onClose, onSave }) {
             }
           }
         }
-        if (bestMatch) {
-          setSelectedCard(bestMatch);
-        } else {
-          setSelectedCard(null);
-        }
+        setSelectedCard(bestMatch || null);
       }
     } else if (!visible) {
       setSearch('');
@@ -80,85 +83,84 @@ export default function CropperModal({ visible, image, onClose, onSave }) {
     }).slice(0, 10);
   }, [search]);
 
-  // Built-in Animated values
+  // --- Proportion-based crop box ---
+  // Calculate mask size from card ratio, scaled to a reasonable viewport size
+  const maskDims = useMemo(() => {
+    if (!selectedCard) return { w: 200, h: 200 };
+    const ratio = selectedCard.w / selectedCard.h;
+    const maxDim = Math.min(SCREEN_WIDTH * 0.7, 400);
+    if (ratio >= 1) {
+      return { w: maxDim, h: maxDim / ratio };
+    }
+    return { w: maxDim * ratio, h: maxDim };
+  }, [selectedCard]);
+
+  const maskW = maskDims.w;
+  const maskH = maskDims.h;
+
+  // Animated values
   const pan = useRef(new Animated.ValueXY()).current;
   const scale = useRef(new Animated.Value(0)).current;
-  
-  // Decoupled slider position for perfect 1:1 finger tracking
   const sliderPos = useRef(new Animated.Value(0)).current;
   const lastSliderPos = useRef(0);
-  
   const lastPan = useRef({ x: 0, y: 0 });
-  const lastScale = useRef(0); // 0 = not initialized; will be set to minScale on first card load
-
+  const lastScale = useRef(0);
   const previousTouchInfo = useRef({ length: 0, center: {x: 0, y: 0}, dist: 0 });
   const minScaleRef = useRef(0.1);
-  const imageSizeRef = useRef({ w: 1000, h: 1000 });
-  
+  // Store ACTUAL image dimensions (not fitted)
+  const imgWRef = useRef(100);
+  const imgHRef = useRef(100);
+  const maskWRef = useRef(maskW);
+  const maskHRef = useRef(maskH);
   const trackWidth = 200;
-  const maxScale = 3; // Reduced max scale
-  
-  // Calculate min scale based on image size and mask size
+  const maxScale = 3;
+
+  // Keep mask refs in sync
+  useEffect(() => { maskWRef.current = maskW; maskHRef.current = maskH; }, [maskW, maskH]);
+
+  // Calculate min scale directly from actual image size
   React.useEffect(() => {
     if (selectedCard && image?.uri) {
       Image.getSize(image.uri, (w, h) => {
-        let renderW, renderH;
-        if (w > h) {
-          renderW = 1000;
-          renderH = 1000 * (h / w);
-        } else {
-          renderH = 1000;
-          renderW = 1000 * (w / h);
-        }
-        imageSizeRef.current = { w: renderW, h: renderH };
-        const maskW = selectedCard.w * 0.5;
-        const maskH = selectedCard.h * 0.5;
-        const calcMinScale = Math.max(maskW / renderW, maskH / renderH);
+        imgWRef.current = w;
+        imgHRef.current = h;
+        const mw = maskWRef.current;
+        const mh = maskHRef.current;
+        const calcMinScale = Math.max(mw / w, mh / h);
         minScaleRef.current = calcMinScale;
-        
-        // Always reset to minimum scale so the image exactly fills the mask
+
         scale.setValue(calcMinScale);
         lastScale.current = calcMinScale;
         lastPan.current = { x: 0, y: 0 };
         pan.setValue({ x: 0, y: 0 });
         lastSliderPos.current = 0;
         sliderPos.setValue(0);
-      }, () => {
-        // Fallback if getSize fails
-        minScaleRef.current = 0.1;
-      });
+      }, () => { minScaleRef.current = 0.1; });
     }
-  }, [selectedCard, image]);
+  }, [selectedCard, image, maskW, maskH]);
 
   const panResponder = useRef(
     PanResponder.create({
       onStartShouldSetPanResponder: () => true,
       onMoveShouldSetPanResponder: () => true,
-      onPanResponderGrant: () => {
-        previousTouchInfo.current = { length: 0 };
-      },
+      onPanResponderGrant: () => { previousTouchInfo.current = { length: 0 }; },
       onPanResponderMove: (evt) => {
         const touches = evt.nativeEvent.touches;
         const applyPanWithBounds = (dx, dy) => {
-          if (!selectedCardRef.current || !imageSizeRef.current) return;
-          
           let newX = lastPan.current.x + dx;
           let newY = lastPan.current.y + dy;
-          
-          const currentScale = lastScale.current;
-          const { w: renderW, h: renderH } = imageSizeRef.current;
-          
-          const maskW = selectedCardRef.current.w * 0.5;
-          const maskH = selectedCardRef.current.h * 0.5;
-          
-          const maxX = Math.max(0, (renderW * currentScale - maskW) / 2);
-          const maxY = Math.max(0, (renderH * currentScale - maskH) / 2);
-          
+          const s = lastScale.current;
+          const iw = imgWRef.current;
+          const ih = imgHRef.current;
+          const mw = maskWRef.current;
+          const mh = maskHRef.current;
+          // Image visible size: iw*s x ih*s. Mask: mw x mh.
+          // Image must cover mask: |pan| <= (iw*s - mw) / 2
+          const maxX = Math.max(0, (iw * s - mw) / 2);
+          const maxY = Math.max(0, (ih * s - mh) / 2);
           newX = Math.max(-maxX, Math.min(maxX, newX));
           newY = Math.max(-maxY, Math.min(maxY, newY));
-          
-          lastPan.current.x = newX;
-          lastPan.current.y = newY;
+          lastPan.current.x = newX; lastPan.current.y = newY;
           pan.setValue({ x: newX, y: newY });
         };
 
@@ -167,79 +169,45 @@ export default function CropperModal({ visible, image, onClose, onSave }) {
           if (previousTouchInfo.current.length !== 1) {
             previousTouchInfo.current = { length: 1, x: t.pageX, y: t.pageY };
           } else {
-            const dx = t.pageX - previousTouchInfo.current.x;
-            const dy = t.pageY - previousTouchInfo.current.y;
-            applyPanWithBounds(dx, dy);
+            applyPanWithBounds(t.pageX - previousTouchInfo.current.x, t.pageY - previousTouchInfo.current.y);
             previousTouchInfo.current = { length: 1, x: t.pageX, y: t.pageY };
           }
         } else if (touches.length >= 2) {
-          const t1 = touches[0];
-          const t2 = touches[1];
+          const t1 = touches[0], t2 = touches[1];
           const center = { x: (t1.pageX + t2.pageX) / 2, y: (t1.pageY + t2.pageY) / 2 };
           const dist = Math.hypot(t1.pageX - t2.pageX, t1.pageY - t2.pageY);
-          
           if (previousTouchInfo.current.length < 2) {
             previousTouchInfo.current = { length: 2, center, dist };
           } else {
             const dx = center.x - previousTouchInfo.current.center.x;
             const dy = center.y - previousTouchInfo.current.center.y;
-            
-            const scaleRatio = dist / previousTouchInfo.current.dist;
-            let newScale = lastScale.current * scaleRatio;
-            
-            if (newScale < minScaleRef.current) {
-                newScale = minScaleRef.current;
-            }
-
-            lastScale.current = newScale;
-            scale.setValue(newScale);
-            
-            // Sync slider position back
-            let percent = (newScale - minScaleRef.current) / (maxScale - minScaleRef.current);
-            if (percent < 0) percent = 0;
-            if (percent > 1) percent = 1;
-            lastSliderPos.current = percent * trackWidth;
-            sliderPos.setValue(percent * trackWidth);
-
-            // Apply pan AFTER scale update so bounds reflect the new scale
+            let ns = Math.max(minScaleRef.current, lastScale.current * (dist / previousTouchInfo.current.dist));
+            lastScale.current = ns; scale.setValue(ns);
+            let pct = Math.max(0, Math.min(1, (ns - minScaleRef.current) / (maxScale - minScaleRef.current)));
+            lastSliderPos.current = pct * trackWidth; sliderPos.setValue(pct * trackWidth);
             applyPanWithBounds(dx, dy);
-            
             previousTouchInfo.current = { length: 2, center, dist };
           }
         }
       },
-      onPanResponderRelease: () => {
-        previousTouchInfo.current = { length: 0 };
-      },
-      onPanResponderTerminate: () => {
-        previousTouchInfo.current = { length: 0 };
-      }
+      onPanResponderRelease: () => { previousTouchInfo.current = { length: 0 }; },
+      onPanResponderTerminate: () => { previousTouchInfo.current = { length: 0 }; }
     })
   ).current;
 
-  // Horizontal Zoom Slider logic
   const sliderStartPos = useRef(0);
 
   const applyPanWithBoundsStandalone = (dx, dy) => {
-    if (!selectedCardRef.current || !imageSizeRef.current) return;
-    
-    let newX = lastPan.current.x + dx;
-    let newY = lastPan.current.y + dy;
-    
-    const currentScale = lastScale.current;
-    const { w: renderW, h: renderH } = imageSizeRef.current;
-    
-    const maskW = selectedCardRef.current.w * 0.5;
-    const maskH = selectedCardRef.current.h * 0.5;
-    
-    const maxX = Math.max(0, (renderW * currentScale - maskW) / 2);
-    const maxY = Math.max(0, (renderH * currentScale - maskH) / 2);
-    
+    let newX = lastPan.current.x + dx, newY = lastPan.current.y + dy;
+    const s = lastScale.current;
+    const iw = imgWRef.current;
+    const ih = imgHRef.current;
+    const mw = maskWRef.current;
+    const mh = maskHRef.current;
+    const maxX = Math.max(0, (iw * s - mw) / 2), maxY = Math.max(0, (ih * s - mh) / 2);
     newX = Math.max(-maxX, Math.min(maxX, newX));
     newY = Math.max(-maxY, Math.min(maxY, newY));
-    
-    lastPan.current.x = newX;
-    lastPan.current.y = newY;
+    lastPan.current.x = newX; lastPan.current.y = newY;
     pan.setValue({ x: newX, y: newY });
   };
 
@@ -249,56 +217,27 @@ export default function CropperModal({ visible, image, onClose, onSave }) {
       onStartShouldSetPanResponderCapture: () => true,
       onMoveShouldSetPanResponder: () => true,
       onMoveShouldSetPanResponderCapture: () => true,
-      onPanResponderGrant: () => {
-        sliderStartPos.current = lastSliderPos.current;
-      },
+      onPanResponderGrant: () => { sliderStartPos.current = lastSliderPos.current; },
       onPanResponderMove: (evt, gestureState) => {
-        // 1:1 perfect finger tracking
-        let newPos = sliderStartPos.current + gestureState.dx;
-        
-        if (newPos < 0) newPos = 0;
-        if (newPos > trackWidth) newPos = trackWidth;
-        
-        lastSliderPos.current = newPos;
-        sliderPos.setValue(newPos);
-        
-        // Map pos back to scale exactly
-        const currentMin = minScaleRef.current;
-        const percent = newPos / trackWidth;
-        const newScale = currentMin + percent * (maxScale - currentMin);
-        
-        lastScale.current = newScale;
-        scale.setValue(newScale);
-        
+        let newPos = Math.max(0, Math.min(trackWidth, sliderStartPos.current + gestureState.dx));
+        lastSliderPos.current = newPos; sliderPos.setValue(newPos);
+        const ns = minScaleRef.current + (newPos / trackWidth) * (maxScale - minScaleRef.current);
+        lastScale.current = ns; scale.setValue(ns);
         applyPanWithBoundsStandalone(0, 0);
       }
     })
   ).current;
 
   const stepZoom = (direction) => {
-    let newPos = lastSliderPos.current + direction * 20; // jump 20 pixels
-    if (newPos < 0) newPos = 0;
-    if (newPos > trackWidth) newPos = trackWidth;
-    
-    lastSliderPos.current = newPos;
-    sliderPos.setValue(newPos);
-    
-    const currentMin = minScaleRef.current;
-    const percent = newPos / trackWidth;
-    const newScale = currentMin + percent * (maxScale - currentMin);
-    
-    lastScale.current = newScale;
-    scale.setValue(newScale);
-    
+    let newPos = Math.max(0, Math.min(trackWidth, lastSliderPos.current + direction * 20));
+    lastSliderPos.current = newPos; sliderPos.setValue(newPos);
+    const ns = minScaleRef.current + (newPos / trackWidth) * (maxScale - minScaleRef.current);
+    lastScale.current = ns; scale.setValue(ns);
     applyPanWithBoundsStandalone(0, 0);
   };
 
   const handleSave = () => {
-    if (!selectedCard) {
-      alert("请先搜索并选择一个卡牌模版");
-      return;
-    }
-    
+    if (!selectedCard) { alert("请先搜索并选择一个卡牌模版"); return; }
     onSave({
       cardId: selectedCard.id,
       cardName: selectedCard.name,
@@ -306,9 +245,17 @@ export default function CropperModal({ visible, image, onClose, onSave }) {
       isBeta: selectedCard.is_beta || false,
       atlas: selectedCard.atlas,
       rect: { x: selectedCard.x, y: selectedCard.y, w: selectedCard.w, h: selectedCard.h },
+      // Save the CROP BOX dimensions so the caller can calculate actual crop from original image
+      cropW: maskW,
+      cropH: maskH,
       transform: { x: lastPan.current.x, y: lastPan.current.y, scale: lastScale.current }
     });
   };
+
+  // Template preview dimensions (using real atlas dimensions)
+  const previewAtlasDims = atlasDims || { w: 4032, h: 4032 };
+  const previewSize = 40;
+  const previewScale = previewSize / Math.max(selectedCard?.w || 100, selectedCard?.h || 100);
 
   return (
     <Modal visible={visible} animationType="slide">
@@ -319,11 +266,10 @@ export default function CropperModal({ visible, image, onClose, onSave }) {
           <TouchableOpacity onPress={handleSave}><Text style={styles.saveText}>保存</Text></TouchableOpacity>
         </View>
 
-        {/* Search Section */}
         <View style={styles.searchSection}>
-          <TextInput 
+          <TextInput
             style={styles.searchInput}
-            placeholder="搜索卡牌名称或分类..."
+            placeholder="搜索卡牌名称..."
             value={search}
             onChangeText={setSearch}
             placeholderTextColor="#8A7E81"
@@ -334,10 +280,7 @@ export default function CropperModal({ visible, image, onClose, onSave }) {
               keyExtractor={item => item.id}
               style={styles.searchList}
               renderItem={({ item }) => (
-                <TouchableOpacity style={styles.searchItem} onPress={() => {
-                    setSelectedCard(item);
-                    setSearch('');
-                }}>
+                <TouchableOpacity style={styles.searchItem} onPress={() => { setSelectedCard(item); setSearch(''); }}>
                   <Text style={styles.searchItemText}>{item.name}{item.is_beta ? ' (Beta)' : ''} ({item.cat})</Text>
                 </TouchableOpacity>
               )}
@@ -348,67 +291,50 @@ export default function CropperModal({ visible, image, onClose, onSave }) {
         {/* Card Template Info */}
         {selectedCard ? (
           <View style={styles.cardInfoBar}>
-            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+            <View style={{ flex: 1, flexDirection: 'row', alignItems: 'center' }}>
               <Ionicons name="card" size={20} color="#F4A8B6" />
-              <Text style={styles.cardInfoText}>目标: {selectedCard.name}{selectedCard.is_beta ? ' (Beta)' : ''} | 尺寸: {selectedCard.w}x{selectedCard.h}</Text>
+              <Text style={styles.cardInfoText}>目标: {selectedCard.name}{selectedCard.is_beta ? ' (Beta)' : ''} | 比例: {selectedCard.w}:{selectedCard.h}</Text>
             </View>
-            {/* Sprite-sheet Template Preview */}
-            {atlasExists ? (() => {
-              const ATLAS_SIZES = {
-                'card_atlas_0.png': { w: 4032, h: 4080 },
-                'card_atlas_1.png': { w: 4032, h: 4028 },
-                'card_atlas_2.png': { w: 2268, h: 4032 },
-              };
-              const atlasSize = ATLAS_SIZES[selectedCard.atlas] || { w: 4032, h: 4032 };
-              const previewSize = 40;
-              const scale = previewSize / Math.max(selectedCard.w, selectedCard.h);
-              const atlasW = atlasSize.w * scale;
-              const atlasH = atlasSize.h * scale;
-              const left = -selectedCard.x * scale;
-              const top = -selectedCard.y * scale;
-              return (
-                <View style={{ width: previewSize, height: previewSize, overflow: 'hidden', borderWidth: 1, borderColor: '#F4A8B6', marginLeft: 10 }}>
-                  <Image
-                    source={{ uri: FileSystem.documentDirectory + 'root/' + selectedCard.atlas }}
-                    style={{
-                      width: atlasW,
-                      height: atlasH,
-                      position: 'absolute',
-                      left,
-                      top,
-                    }}
-                  />
-                </View>
-              );
-            })() : (
+            {atlasExists ? (
+              <View style={{ width: previewSize, height: previewSize, overflow: 'hidden', borderWidth: 1, borderColor: '#F4A8B6', marginLeft: 10 }}>
+                <Image
+                  source={{ uri: FileSystem.documentDirectory + 'root/' + selectedCard.atlas }}
+                  style={{
+                    width: previewAtlasDims.w * previewScale,
+                    height: previewAtlasDims.h * previewScale,
+                    position: 'absolute',
+                    left: -selectedCard.x * previewScale,
+                    top: -selectedCard.y * previewScale,
+                  }}
+                />
+              </View>
+            ) : (
               <View style={{ width: 40, height: 40, borderWidth: 1, borderColor: '#F2E1E6', marginLeft: 10, justifyContent: 'center', alignItems: 'center' }}>
                 <Ionicons name="image-outline" size={18} color="#D1D1D1" />
               </View>
             )}
           </View>
         ) : (
-          <View style={styles.cardInfoBar}><Text style={styles.promptText}>请先搜索卡牌模版以确定裁剪尺寸</Text></View>
+          <View style={styles.cardInfoBar}><Text style={styles.promptText}>请先搜索卡牌模版以确定裁剪比例</Text></View>
         )}
 
-        {/* Cropper Area */}
+        {/* Cropper Area — mask maintains card ratio */}
         <View style={styles.cropContainer} {...panResponder.panHandlers}>
           <Animated.View style={[
-            styles.imageWrapper, 
+            { width: imgWRef.current, height: imgHRef.current },
             { transform: [{ translateX: pan.x }, { translateY: pan.y }, { scale: scale }] }
           ]}>
-            <Image source={{ uri: image.uri }} style={styles.image} />
+            <Image source={{ uri: image?.uri }} style={{ width: '100%', height: '100%' }} />
           </Animated.View>
 
-          {/* Mask Overlay */}
           {selectedCard && (
             <View style={styles.maskOverlay} pointerEvents="none">
-              <View style={[styles.maskHole, { width: selectedCard.w * 0.5, height: selectedCard.h * 0.5 }]} />
+              <View style={[styles.maskHole, { width: maskW, height: maskH }]} />
             </View>
           )}
         </View>
 
         <View style={styles.footer}>
-          {/* Horizontal Zoom Slider */}
           <View style={styles.horizontalSliderContainer}>
             <TouchableOpacity onPress={() => stepZoom(-1)} style={{ padding: 10 }}>
               <Ionicons name="remove" size={24} color="#C0CAF5" />
@@ -420,7 +346,6 @@ export default function CropperModal({ visible, image, onClose, onSave }) {
               <Ionicons name="add" size={24} color="#C0CAF5" />
             </TouchableOpacity>
           </View>
-
           <Text style={styles.footerHint}>提示：双指缩放，单指拖动图片对准方框</Text>
           <Text style={styles.footerImageName}>当前图片: {image?.name}</Text>
         </View>
@@ -431,14 +356,7 @@ export default function CropperModal({ visible, image, onClose, onSave }) {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#1A1B26' },
-  header: { 
-    flexDirection: 'row', 
-    justifyContent: 'space-between', 
-    padding: 20, 
-    alignItems: 'center',
-    borderBottomWidth: 1,
-    borderBottomColor: '#333'
-  },
+  header: { flexDirection: 'row', justifyContent: 'space-between', padding: 20, alignItems: 'center', borderBottomWidth: 1, borderBottomColor: '#333' },
   cancelText: { color: '#8A7E81', fontSize: 16 },
   title: { color: '#FFF', fontSize: 18, fontWeight: 'bold' },
   saveText: { color: '#A3D9A5', fontSize: 16, fontWeight: 'bold' },
@@ -448,43 +366,15 @@ const styles = StyleSheet.create({
   searchItem: { padding: 15, borderBottomWidth: 1, borderBottomColor: '#1A1B26' },
   searchItemText: { color: '#C0CAF5' },
   cardInfoBar: { flexDirection: 'row', padding: 15, backgroundColor: '#24283B', alignItems: 'center' },
-  cardInfoText: { color: '#F4A8B6', marginLeft: 10, fontWeight: 'bold' },
+  cardInfoText: { color: '#F4A8B6', marginLeft: 10, fontWeight: 'bold', flex: 1 },
   promptText: { color: '#8A7E81', fontStyle: 'italic' },
   cropContainer: { flex: 1, overflow: 'hidden', justifyContent: 'center', alignItems: 'center', backgroundColor: '#000' },
-  imageWrapper: { width: 1000, height: 1000, justifyContent: 'center', alignItems: 'center' },
-  image: { width: '100%', height: '100%', resizeMode: 'contain' },
   maskOverlay: { ...StyleSheet.absoluteFillObject, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.5)' },
   maskHole: { borderWidth: 2, borderColor: '#F4A8B6', backgroundColor: 'transparent' },
   footer: { padding: 20, alignItems: 'center' },
   footerHint: { color: '#8A7E81', fontSize: 12 },
   footerImageName: { color: '#F4A8B6', marginTop: 10, fontSize: 14, fontWeight: 'bold' },
-  horizontalSliderContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    width: '100%',
-    justifyContent: 'center',
-    marginBottom: 15,
-    paddingVertical: 10,
-  },
-  horizontalSliderTrack: {
-    width: 200,
-    height: 6,
-    backgroundColor: '#8A7E81',
-    borderRadius: 3,
-    marginHorizontal: 15,
-    justifyContent: 'center'
-  },
-  horizontalSliderKnob: {
-    position: 'absolute',
-    left: -12,
-    width: 24,
-    height: 24,
-    borderRadius: 12,
-    backgroundColor: '#F4A8B6',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.5,
-    shadowRadius: 3,
-    elevation: 5
-  }
+  horizontalSliderContainer: { flexDirection: 'row', alignItems: 'center', width: '100%', justifyContent: 'center', marginBottom: 15, paddingVertical: 10 },
+  horizontalSliderTrack: { width: 200, height: 6, backgroundColor: '#8A7E81', borderRadius: 3, marginHorizontal: 15, justifyContent: 'center' },
+  horizontalSliderKnob: { position: 'absolute', left: -12, width: 24, height: 24, borderRadius: 12, backgroundColor: '#F4A8B6', shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.5, shadowRadius: 3, elevation: 5 }
 });

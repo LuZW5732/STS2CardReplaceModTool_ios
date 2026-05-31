@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { View, Text, FlatList, TouchableOpacity, StyleSheet, Image, Alert, ActivityIndicator, TextInput, Modal, Animated } from 'react-native';
+import { View, Text, FlatList, TouchableOpacity, StyleSheet, Image, Alert, ActivityIndicator, TextInput, Modal, ScrollView } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import * as FileSystem from 'expo-file-system/legacy';
 import JSZip from 'jszip';
@@ -50,23 +50,34 @@ function generateUid(seed) {
   return 'uid://' + b64;
 }
 
-function generateImportText(atlasName, uid) {
-  const sp = `res://ArtWorks/Atlas/${atlasName}`;
-  const hash = SparkMD5.hash(sp);
-  return `[remap]\nimporter="texture"\ntype="CompressedTexture2D"\nuid="${uid}"\npath="res://.godot/imported/${atlasName}-${hash}.ctex"\nmetadata={\n"vram_texture": false\n}\n`;
+function generatePngImport(cardName, sourcePath, uidStr, ctexHash) {
+  return (
+    `[remap]\n\n` +
+    `importer="texture"\n` +
+    `type="CompressedTexture2D"\n` +
+    `uid="${uidStr}"\n` +
+    `path="res://.godot/imported/${cardName}.png-${ctexHash}.ctex"\n` +
+    `metadata={\n"vram_texture": false\n}\n\n` +
+    `[deps]\n\n` +
+    `source_file="${sourcePath}"\n` +
+    `dest_files=["res://.godot/imported/${cardName}.png-${ctexHash}.ctex"]\n\n` +
+    `[params]\n\n` +
+    `compress/mode=0\ncompress/high_quality=false\ncompress/lossy_quality=1.0\n` +
+    `compress/uastc_level=2\ncompress/rdo_quality_loss=0\ncompress/hdr_compression=0\n` +
+    `compress/normal_map=0\ncompress/channel_pack=0\nmipmaps/generate=false\n` +
+    `mipmaps/limit=-1\nroughness/mode=0\nroughness/src_normal=""\n` +
+    `process/fix_alpha_border=false\nprocess/premult_alpha=false\n` +
+    `process/normal_map_invert_y=false\nprocess/hdr_as_srgb=false\n` +
+    `process/hdr_clamp_exposure=false\nprocess/size_limit=0\ndetect_3d/compress_to=0\n`
+  );
 }
 
 function generateTresRemap(hashHex, cardName) {
-  return `[remap]\n\npath="res://ArtWorks/Atlas/mod/${hashHex}-${cardName}.tres"\n`;
+  return `[remap]\n\npath="res://.godot/exported/133200997/export-${hashHex}-${cardName}.res"\n`;
 }
 
-function generateTresFile(atlasSp, uid, x, y, w, h) {
-  return `[gd_resource type="AtlasTexture" load_steps=2 format=3 uid="${uid}"]
-[ext_resource type="Texture2D" path="${atlasSp}" id="1"]
-[resource]
-atlas = ExtResource("1")
-region = Rect2(${x}, ${y}, ${w}, ${h})
-`;
+function generateTresContent(atlasSp, uid, x, y, w, h) {
+  return `[gd_resource type="AtlasTexture" load_steps=2 format=3 uid="${uid}"]\n[ext_resource type="Texture2D" path="${atlasSp}" id="1"]\n[resource]\natlas = ExtResource("1")\nregion = Rect2(${x}, ${y}, ${w}, ${h})\n`;
 }
 
 function buildUidCacheBin(cards) {
@@ -98,7 +109,6 @@ function buildUidCacheBin(cards) {
     new DataView(lenBytes.buffer).setUint32(0, tresSp.length, true);
     return { uid8, lenBytes, pathBytes };
   });
-
   const countBytes = new Uint8Array(4);
   new DataView(countBytes.buffer).setUint32(0, entries.length, true);
   let totalLen = 4;
@@ -114,29 +124,276 @@ function buildUidCacheBin(cards) {
   return result;
 }
 
-// Transform from CropperModal UI space to original-image crop rectangle
-function calculateCrop(imageWidth, imageHeight, cardW, cardH, transform) {
-  const { x, y, scale } = transform || { x: 0, y: 0, scale: 1 };
-  // Image fitted size in 1000x1000 viewer
-  const renderW = imageWidth > imageHeight ? 1000 : 1000 * (imageWidth / imageHeight);
-  const renderH = imageHeight > imageWidth ? 1000 : 1000 * (imageHeight / imageWidth);
-  const maskW = cardW / 2;
-  const maskH = cardH / 2;
-  // Visible area size in fitted coords
-  const visW = maskW / scale;
-  const visH = maskH / scale;
-  // Visible area center in fitted coords (pan inverted)
-  const visCX = -x + renderW / 2;
-  const visCY = -y + renderH / 2;
-  // Convert to original image coords
-  const sx = renderW / imageWidth;
-  const sy = renderH / imageHeight;
-  return {
-    originX: Math.round((visCX - visW / 2) / sx),
-    originY: Math.round((visCY - visH / 2) / sy),
-    width: Math.round(visW / sx),
-    height: Math.round(visH / sy)
+function getDupMap(stagingImages) {
+  const groups = {};
+  stagingImages.forEach((img, i) => {
+    if (img.binding) {
+      const key = `${img.binding.cardCat}|||${img.binding.cardName}|||${img.binding.isBeta ? '1' : '0'}`;
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(i);
+    }
+  });
+  const result = {};
+  for (const [k, v] of Object.entries(groups)) {
+    if (v.length > 1) result[k] = v;
+  }
+  return result;
+}
+
+// --- DuplicateBindingModal ---
+function DuplicateBindingModal({ visible, stagingImages, cardsData, onResolve, onCancel }) {
+  const dupMap = getDupMap(stagingImages);
+  const dupEntries = Object.entries(dupMap); // [[key, indices], ...]
+  const [currentIdx, setCurrentIdx] = useState(0);
+  const [selectedImgIdx, setSelectedImgIdx] = useState(null);
+  const [resolved, setResolved] = useState(new Set());
+  const [userImageDim, setUserImageDim] = useState(null);
+  const [atlasDims, setAtlasDims] = useState({});
+
+  useEffect(() => {
+    if (visible && dupEntries.length > 0) {
+      setCurrentIdx(0);
+      setSelectedImgIdx(0);
+      setResolved(new Set());
+      setAtlasDims({});
+    }
+  }, [visible]);
+
+  const currentEntry = dupEntries[currentIdx];
+  const currentKey = currentEntry ? currentEntry[0] : null;
+  const currentIndices = currentEntry ? currentEntry[1] : [];
+  const selectedImg = currentIndices.length > 0 && selectedImgIdx !== null && selectedImgIdx < currentIndices.length
+    ? stagingImages[currentIndices[selectedImgIdx]] : null;
+
+  // Load atlas dimensions for current conflict template's original card
+  // Match on name, category, AND beta status for accurate preview
+  const currentBinding = selectedImg?.binding;
+  const cardForPreview = currentBinding
+    ? cardsData.find(c =>
+        c.name === currentBinding.cardName &&
+        c.cat === currentBinding.cardCat &&
+        !!c.is_beta === !!currentBinding.isBeta
+      )
+    : null;
+
+  useEffect(() => {
+    if (cardForPreview?.atlas) {
+      const atlasPath = FileSystem.documentDirectory + 'root/' + cardForPreview.atlas;
+      const cacheKey = cardForPreview.atlas;
+      if (!atlasDims[cacheKey]) {
+        Image.getSize(atlasPath,
+          (w, h) => setAtlasDims(prev => ({ ...prev, [cacheKey]: { w, h } })),
+          () => {}
+        );
+      }
+    }
+  }, [cardForPreview]);
+
+  // Update preview when selected image changes
+  useEffect(() => {
+    if (selectedImg) {
+      Image.getSize(selectedImg.uri, (w, h) => setUserImageDim({ w, h }), () => setUserImageDim(null));
+    }
+  }, [currentIdx, selectedImgIdx]);
+
+  const handleConfirm = () => {
+    if (selectedImgIdx === null || !currentEntry) return;
+    const [key, indices] = currentEntry;
+    const changes = [];
+    indices.forEach((ti, j) => {
+      changes.push({ index: ti, keep: j === selectedImgIdx });
+    });
+    setResolved(prev => new Set([...prev, key]));
+    onResolve(changes);
+    advanceToNext();
   };
+
+  const handleSkip = () => { advanceToNext(); };
+
+  const advanceToNext = () => {
+    for (let i = currentIdx + 1; i < dupEntries.length; i++) {
+      if (!resolved.has(dupEntries[i][0])) { setCurrentIdx(i); setSelectedImgIdx(0); return; }
+    }
+    for (let i = 0; i < currentIdx; i++) {
+      if (!resolved.has(dupEntries[i][0])) { setCurrentIdx(i); setSelectedImgIdx(0); return; }
+    }
+    onResolve(null);
+  };
+
+  const handleFinish = () => {
+    const unresolved = dupEntries.filter(([k]) => !resolved.has(k));
+    if (unresolved.length > 0) {
+      Alert.alert('确认', `还有 ${unresolved.length} 个冲突未解决，确定跳过直接封包吗？`, [
+        { text: '取消', style: 'cancel' },
+        { text: '确定', onPress: () => onResolve('pack') }
+      ]);
+    } else {
+      onResolve('pack');
+    }
+  };
+
+  if (!visible || dupEntries.length === 0) return null;
+
+  // Atlas preview: crop around card region so it's centered and maximized
+  const atlasKey = cardForPreview?.atlas;
+  const aDims = atlasDims[atlasKey] || { w: 4032, h: 4032 };
+  const prevContainer = 150;
+
+  let atlasPreviewStyle = null;
+  if (cardForPreview && cardForPreview.atlas) {
+    // Focus region: card bounds with padding all around
+    const padX = cardForPreview.w * 0.6;
+    const padY = cardForPreview.h * 0.6;
+    const focusX = Math.max(0, cardForPreview.x - padX);
+    const focusY = Math.max(0, cardForPreview.y - padY);
+    const focusW = Math.min(cardForPreview.w + padX * 2, aDims.w - focusX);
+    const focusH = Math.min(cardForPreview.h + padY * 2, aDims.h - focusY);
+
+    // Scale so the focus region fills the preview container
+    const focusScale = prevContainer / Math.max(focusW, focusH);
+    const atlasDispW = aDims.w * focusScale;
+    const atlasDispH = aDims.h * focusScale;
+
+    // Position: center the focus region in the container
+    const offsetX = prevContainer / 2 - (focusX + focusW / 2) * focusScale;
+    const offsetY = prevContainer / 2 - (focusY + focusH / 2) * focusScale;
+
+    atlasPreviewStyle = {
+      width: atlasDispW,
+      height: atlasDispH,
+      position: 'absolute',
+      left: offsetX,
+      top: offsetY,
+    };
+  }
+
+  return (
+    <Modal visible={visible} animationType="slide" transparent>
+      <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', padding: 15 }}>
+        <View style={{ backgroundColor: '#FFF', borderRadius: 15, maxHeight: '92%', padding: 20 }}>
+          <Text style={{ fontSize: 18, fontWeight: 'bold', color: '#4A4043', marginBottom: 8 }}>
+            重复绑定检测
+          </Text>
+          <Text style={{ fontSize: 13, color: '#F2C78A', marginBottom: 10 }}>
+            共 {dupEntries.length} 个冲突 | 已解决: {resolved.size} | 剩余: {dupEntries.length - resolved.size}
+          </Text>
+
+          {/* Selectable template list */}
+          <Text style={{ fontSize: 12, color: '#8A7E81', marginBottom: 4 }}>冲突模板列表（点击选择）：</Text>
+          <ScrollView style={{ maxHeight: 100, backgroundColor: '#FDF6F9', borderRadius: 8, marginBottom: 10 }}>
+            {dupEntries.map(([key, indices], i) => {
+              const parts = key.split('|||');
+              const label = `${parts[0]} / ${parts[1]}${parts[2] === '1' ? ' (Beta)' : ''}`;
+              const isCurrent = i === currentIdx;
+              const isResolved = resolved.has(key);
+              return (
+                <TouchableOpacity
+                  key={key}
+                  style={{
+                    flexDirection: 'row', alignItems: 'center', padding: 10,
+                    backgroundColor: isCurrent ? '#FDE2E8' : 'transparent',
+                    borderBottomWidth: 1, borderBottomColor: '#F2E1E6'
+                  }}
+                  onPress={() => { setCurrentIdx(i); setSelectedImgIdx(0); }}
+                >
+                  <Ionicons
+                    name={isResolved ? 'checkmark-circle' : (isCurrent ? 'radio-button-on' : 'radio-button-off')}
+                    size={18}
+                    color={isResolved ? '#A3D9A5' : '#F4A8B6'}
+                  />
+                  <Text style={{ marginLeft: 8, fontSize: 13, color: isResolved ? '#A3D9A5' : '#4A4043' }} numberOfLines={1}>
+                    {isResolved ? '✓ ' : '● '}{label}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+          </ScrollView>
+
+          {/* Current conflict detail */}
+          {currentEntry && (
+            <>
+              <Text style={{ fontSize: 14, fontWeight: 'bold', color: '#4A4043', marginBottom: 5 }}>
+                {currentKey ? currentKey.split('|||').slice(0, 2).join(' / ') : ''}
+              </Text>
+
+              <Text style={{ fontSize: 12, color: '#8A7E81', marginBottom: 5 }}>绑定该模板的图片（点击选择保留项）：</Text>
+              <ScrollView style={{ maxHeight: 120, backgroundColor: '#FDF6F9', borderRadius: 8, marginBottom: 10 }}>
+                {currentIndices.map((ti, j) => {
+                  const img = stagingImages[ti];
+                  const isSel = j === selectedImgIdx;
+                  return (
+                    <TouchableOpacity
+                      key={j}
+                      style={{ flexDirection: 'row', alignItems: 'center', padding: 10, backgroundColor: isSel ? '#FFD4D4' : 'transparent', borderBottomWidth: 1, borderBottomColor: '#F2E1E6' }}
+                      onPress={() => setSelectedImgIdx(j)}
+                    >
+                      <Ionicons name={isSel ? 'radio-button-on' : 'radio-button-off'} size={20} color="#F4A8B6" />
+                      <Text style={{ marginLeft: 8, fontSize: 13, color: '#4A4043' }} numberOfLines={1}>{img.name}</Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </ScrollView>
+
+              {/* Previews */}
+              <View style={{ flexDirection: 'row', justifyContent: 'space-around', marginBottom: 15 }}>
+                <View style={{ alignItems: 'center', flex: 1 }}>
+                  <Text style={{ fontSize: 11, color: '#8A7E81', marginBottom: 4 }}>替换图片</Text>
+                  {selectedImg ? (
+                    <Image source={{ uri: selectedImg.uri }} style={{ width: 150, height: 150, borderRadius: 8, resizeMode: 'contain', backgroundColor: '#EEE' }} />
+                  ) : (
+                    <View style={{ width: 150, height: 150, borderRadius: 8, backgroundColor: '#EEE', justifyContent: 'center', alignItems: 'center' }}>
+                      <Ionicons name="image-outline" size={40} color="#D1D1D1" />
+                    </View>
+                  )}
+                  {userImageDim && <Text style={{ fontSize: 10, color: '#8A7E81', marginTop: 2 }}>{userImageDim.w}x{userImageDim.h}</Text>}
+                </View>
+                <View style={{ alignItems: 'center', flex: 1 }}>
+                  <Text style={{ fontSize: 11, color: '#8A7E81', marginBottom: 4 }}>原卡图</Text>
+                  {atlasPreviewStyle ? (
+                    <View style={{ width: prevContainer, height: prevContainer, borderRadius: 8, overflow: 'hidden', backgroundColor: '#EEE' }}>
+                      <Image
+                        source={{ uri: FileSystem.documentDirectory + 'root/' + cardForPreview.atlas }}
+                        style={atlasPreviewStyle}
+                      />
+                    </View>
+                  ) : (
+                    <View style={{ width: 150, height: 150, borderRadius: 8, backgroundColor: '#EEE', justifyContent: 'center', alignItems: 'center' }}>
+                      <Ionicons name="card" size={40} color="#D1D1D1" />
+                    </View>
+                  )}
+                  {cardForPreview && (
+                    <Text style={{ fontSize: 10, color: '#8A7E81', marginTop: 2 }}>
+                      模板: {cardForPreview.name} {cardForPreview.w}x{cardForPreview.h}
+                    </Text>
+                  )}
+                </View>
+              </View>
+            </>
+          )}
+
+          {/* Buttons */}
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+            <View style={{ flexDirection: 'row' }}>
+              <TouchableOpacity onPress={handleConfirm} style={{ backgroundColor: '#A3D9A5', paddingHorizontal: 16, paddingVertical: 10, borderRadius: 8, marginRight: 8 }}>
+                <Text style={{ color: '#FFF', fontWeight: 'bold' }}>确认关系</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={handleSkip} style={{ backgroundColor: '#F0E4E8', paddingHorizontal: 16, paddingVertical: 10, borderRadius: 8 }}>
+                <Text style={{ color: '#4A4043', fontWeight: 'bold' }}>跳过</Text>
+              </TouchableOpacity>
+            </View>
+            <View style={{ flexDirection: 'row' }}>
+              <TouchableOpacity onPress={onCancel} style={{ backgroundColor: '#F0E4E8', paddingHorizontal: 16, paddingVertical: 10, borderRadius: 8, marginRight: 8 }}>
+                <Text style={{ color: '#4A4043' }}>返回</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={handleFinish} style={{ backgroundColor: '#A3D9A5', paddingHorizontal: 16, paddingVertical: 10, borderRadius: 8 }}>
+                <Text style={{ color: '#FFF', fontWeight: 'bold' }}>全部解决，进行封包</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
 }
 
 // --- Mod Info Modal ---
@@ -176,6 +433,75 @@ function ModInfoModal({ visible, onClose, onConfirm, initial }) {
       </View>
     </Modal>
   );
+}
+
+// --- Main Component ---
+
+const HISTORY_DIR = FileSystem.documentDirectory + 'history/';
+
+async function ensureHistoryDir() {
+  const info = await FileSystem.getInfoAsync(HISTORY_DIR);
+  if (!info.exists) await FileSystem.makeDirectoryAsync(HISTORY_DIR, { intermediates: true });
+}
+
+async function loadHistory() {
+  await ensureHistoryDir();
+  try {
+    const items = await FileSystem.readDirectoryAsync(HISTORY_DIR);
+    const records = [];
+    for (const item of items) {
+      if (item.endsWith('.json')) {
+        const content = await FileSystem.readAsStringAsync(HISTORY_DIR + item);
+        records.push(JSON.parse(content));
+      }
+    }
+    records.sort((a, b) => b.timestamp - a.timestamp);
+    return records;
+  } catch (e) { return []; }
+}
+
+async function saveHistory(pckName, modInfo, stagingImages) {
+  await ensureHistoryDir();
+  const now = new Date();
+  const id = `export_${now.toISOString().replace(/[-:T]/g, '').slice(0, 14)}`;
+  const record = {
+    id,
+    time: now.toLocaleString('zh-CN'),
+    timestamp: now.getTime(),
+    pckName,
+    modInfo,
+    bindCount: stagingImages.filter(img => img.binding).length,
+    bindings: stagingImages.map(img => ({
+      name: img.name,
+      uri: img.uri,
+      binding: img.binding ? { ...img.binding } : null
+    }))
+  };
+  for (const img of stagingImages) {
+    const destName = `${id}_${img.name}`;
+    try {
+      const destInfo = await FileSystem.getInfoAsync(HISTORY_DIR + destName);
+      if (!destInfo.exists) {
+        await FileSystem.copyAsync({ from: img.uri, to: HISTORY_DIR + destName });
+      }
+      const bindingRec = record.bindings.find(b => b.name === img.name);
+      if (bindingRec) bindingRec.historyUri = HISTORY_DIR + destName;
+    } catch (e) { console.warn('Failed to copy image for history:', e); }
+  }
+  await FileSystem.writeAsStringAsync(HISTORY_DIR + id + '.json', JSON.stringify(record));
+  return record;
+}
+
+async function deleteHistory(id) {
+  const jsonPath = HISTORY_DIR + id + '.json';
+  try {
+    const content = await FileSystem.readAsStringAsync(jsonPath);
+    const record = JSON.parse(content);
+    for (const b of (record.bindings || [])) {
+      if (b.historyUri) await FileSystem.deleteAsync(b.historyUri, { idempotent: true });
+    }
+  } catch (e) {}
+  await FileSystem.deleteAsync(jsonPath, { idempotent: true });
 }
 
 // --- History Modal ---
@@ -221,80 +547,6 @@ function HistoryModal({ visible, onClose, onRestore, onDelete, records }) {
   );
 }
 
-// --- Helpers for history persistence ---
-const HISTORY_DIR = FileSystem.documentDirectory + 'history/';
-
-async function ensureHistoryDir() {
-  const info = await FileSystem.getInfoAsync(HISTORY_DIR);
-  if (!info.exists) await FileSystem.makeDirectoryAsync(HISTORY_DIR, { intermediates: true });
-}
-
-async function loadHistory() {
-  await ensureHistoryDir();
-  try {
-    const items = await FileSystem.readDirectoryAsync(HISTORY_DIR);
-    const records = [];
-    for (const item of items) {
-      if (item.endsWith('.json')) {
-        const content = await FileSystem.readAsStringAsync(HISTORY_DIR + item);
-        records.push(JSON.parse(content));
-      }
-    }
-    records.sort((a, b) => b.timestamp - a.timestamp);
-    return records;
-  } catch (e) { return []; }
-}
-
-async function saveHistory(pckName, modInfo, stagingImages, cardsData) {
-  await ensureHistoryDir();
-  const now = new Date();
-  const id = `export_${now.toISOString().replace(/[-:T]/g, '').slice(0, 14)}`;
-  const record = {
-    id,
-    time: now.toLocaleString('zh-CN'),
-    timestamp: now.getTime(),
-    pckName,
-    modInfo,
-    bindCount: stagingImages.filter(img => img.binding).length,
-    // Save serializable binding state
-    bindings: stagingImages.map(img => ({
-      name: img.name,
-      uri: img.uri,
-      binding: img.binding ? { ...img.binding } : null
-    }))
-  };
-  // Copy images to history folder so they persist across sessions
-  for (const img of stagingImages) {
-    const destName = `${id}_${img.name}`;
-    try {
-      const destInfo = await FileSystem.getInfoAsync(HISTORY_DIR + destName);
-      if (!destInfo.exists) {
-        await FileSystem.copyAsync({ from: img.uri, to: HISTORY_DIR + destName });
-      }
-      // Update binding uri reference
-      const bindingRec = record.bindings.find(b => b.name === img.name);
-      if (bindingRec) bindingRec.historyUri = HISTORY_DIR + destName;
-    } catch (e) { console.warn('Failed to copy image for history:', e); }
-  }
-  await FileSystem.writeAsStringAsync(HISTORY_DIR + id + '.json', JSON.stringify(record));
-  return record;
-}
-
-async function deleteHistory(id) {
-  const jsonPath = HISTORY_DIR + id + '.json';
-  try {
-    const content = await FileSystem.readAsStringAsync(jsonPath);
-    const record = JSON.parse(content);
-    // Delete associated images
-    for (const b of (record.bindings || [])) {
-      if (b.historyUri) await FileSystem.deleteAsync(b.historyUri, { idempotent: true });
-    }
-  } catch (e) {}
-  await FileSystem.deleteAsync(jsonPath, { idempotent: true });
-}
-
-// --- Main Component ---
-
 export default function BindingScreen() {
   const { stagingImages, setStagingImages, cardsData, removeImageFromStaging, updateBinding } = useBindings();
   const [selectedImage, setSelectedImage] = useState(null);
@@ -303,127 +555,109 @@ export default function BindingScreen() {
   const [packStep, setPackStep] = useState('');
   const [showModInfo, setShowModInfo] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  const [showDupModal, setShowDupModal] = useState(false);
   const [modInfo, setModInfo] = useState({ pckName: 'CardReplaceMod1', modName: 'STS2 iOS Mod', author: '', desc: '', version: '1.0.0' });
   const [historyRecords, setHistoryRecords] = useState([]);
   const [multiSelectMode, setMultiSelectMode] = useState(false);
   const [selectedUris, setSelectedUris] = useState(new Set());
   const packerEngineRef = useRef(null);
-  const canvasCallbackRef = useRef(null);
-
-  const autoBindAll = () => {
-    if (stagingImages.length === 0) {
-      Alert.alert('提示', '没有可绑定的图片，请先从文件浏览中添加！');
-      return;
-    }
-
-    let successCount = 0;
-    const failList = [];
-
-    const newImages = stagingImages.map(img => {
-      if (img.binding) return img; // skip already bound
-
-      const key = extractKey(img.name);
-      if (!key) {
-        failList.push(img.name);
-        return img;
-      }
-
-      const nKey = norm(key);
-      let bestMatch = null;
-      for (const c of cardsData) {
-        const rn = norm(c.name);
-        if (rn && rn.length > 0 && nKey.includes(rn)) {
-          if (!bestMatch || rn.length > norm(bestMatch.name).length) {
-            bestMatch = c;
-          }
-        }
-      }
-
-      // Only bind if exactly one unique match
-      if (bestMatch) {
-        // Check if there are multiple cards with the same normalized name (ambiguous)
-        const sameNameCount = cardsData.filter(c => norm(c.name) === norm(bestMatch.name)).length;
-        if (sameNameCount > 1) {
-          failList.push(img.name);
-          return img;
-        }
-        successCount++;
-        return {
-          ...img,
-          binding: {
-            cardId: bestMatch.id,
-            cardName: bestMatch.name,
-            cardCat: bestMatch.cat,
-            isBeta: bestMatch.is_beta || false,
-            atlas: bestMatch.atlas,
-            rect: { x: bestMatch.x, y: bestMatch.y, w: bestMatch.w, h: bestMatch.h },
-            transform: { x: 0, y: 0, scale: 1 }
-          }
-        };
-      } else {
-        failList.push(img.name);
-        return img;
-      }
-    });
-
-    setStagingImages(newImages);
-
-    const total = successCount + failList.length;
-    if (failList.length === 0) {
-      Alert.alert('自动绑定完成', `全部 ${successCount} 张图片已成功绑定！`);
-    } else {
-      Alert.alert(
-        '自动绑定结果',
-        `成功绑定: ${successCount} 个\n未能绑定: ${failList.length} 个\n\n以下图片未能自动绑定：\n${failList.join('\n')}`,
-        [{ text: '确定' }]
-      );
-    }
-  };
-
-  const selectAll = () => {
-    setSelectedUris(new Set(stagingImages.map(img => img.uri)));
-  };
-
-  const invertSelection = () => {
-    const newSel = new Set();
-    stagingImages.forEach(img => {
-      if (!selectedUris.has(img.uri)) newSel.add(img.uri);
-    });
-    setSelectedUris(newSel);
-  };
-
-  const deleteSelected = () => {
-    if (selectedUris.size === 0) return;
-    Alert.alert('确认', `确定要删除选中的 ${selectedUris.size} 个项目吗？`, [
-      { text: '取消', style: 'cancel' },
-      {
-        text: '删除', style: 'destructive', onPress: () => {
-          const remaining = stagingImages.filter(img => !selectedUris.has(img.uri));
-          setStagingImages(remaining);
-          setSelectedUris(new Set());
-          setMultiSelectMode(false);
-        }
-      }
-    ]);
-  };
-
-  const toggleSelectUri = (uri) => {
-    const newSel = new Set(selectedUris);
-    if (newSel.has(uri)) newSel.delete(uri);
-    else newSel.add(uri);
-    setSelectedUris(newSel);
-  };
 
   const handleOpenCropper = (image) => {
     setSelectedImage(image);
     setIsCropperVisible(true);
   };
 
+  const autoBindAll = () => {
+    if (stagingImages.length === 0) {
+      Alert.alert('提示', '没有可绑定的图片，请先从文件浏览中添加！');
+      return;
+    }
+    let successCount = 0;
+    const failList = [];
+    const newImages = stagingImages.map(img => {
+      if (img.binding) return img;
+      const key = extractKey(img.name);
+      if (!key) { failList.push(img.name); return img; }
+      const nKey = norm(key);
+      let bestMatch = null;
+      for (const c of cardsData) {
+        const rn = norm(c.name);
+        if (rn && rn.length > 0 && nKey.includes(rn)) {
+          if (!bestMatch || rn.length > norm(bestMatch.name).length) bestMatch = c;
+        }
+      }
+      if (bestMatch) {
+        const sameNameCount = cardsData.filter(c => norm(c.name) === norm(bestMatch.name)).length;
+        if (sameNameCount > 1) { failList.push(img.name); return img; }
+        successCount++;
+        return { ...img, binding: { cardId: bestMatch.id, cardName: bestMatch.name, cardCat: bestMatch.cat, isBeta: bestMatch.is_beta || false, atlas: bestMatch.atlas, rect: { x: bestMatch.x, y: bestMatch.y, w: bestMatch.w, h: bestMatch.h }, transform: { x: 0, y: 0, scale: 1 } } };
+      }
+      failList.push(img.name); return img;
+    });
+    setStagingImages(newImages);
+    if (failList.length === 0) {
+      Alert.alert('自动绑定完成', `全部 ${successCount} 张图片已成功绑定！`);
+    } else {
+      Alert.alert('自动绑定结果', `成功绑定: ${successCount} 个\n未能绑定: ${failList.length} 个\n\n以下图片未能自动绑定：\n${failList.join('\n')}`);
+    }
+  };
+
+  const selectAll = () => { setSelectedUris(new Set(stagingImages.map(img => img.uri))); };
+  const invertSelection = () => {
+    const newSel = new Set();
+    stagingImages.forEach(img => { if (!selectedUris.has(img.uri)) newSel.add(img.uri); });
+    setSelectedUris(newSel);
+  };
+  const deleteSelected = () => {
+    if (selectedUris.size === 0) return;
+    Alert.alert('确认', `确定要删除选中的 ${selectedUris.size} 个项目吗？`, [
+      { text: '取消', style: 'cancel' },
+      { text: '删除', style: 'destructive', onPress: () => {
+          setStagingImages(stagingImages.filter(img => !selectedUris.has(img.uri)));
+          setSelectedUris(new Set()); setMultiSelectMode(false);
+      }}
+    ]);
+  };
+  const toggleSelectUri = (uri) => {
+    const newSel = new Set(selectedUris);
+    if (newSel.has(uri)) newSel.delete(uri); else newSel.add(uri);
+    setSelectedUris(newSel);
+  };
+
+  // --- Pack logic: independent file mode ---
   const handleStartPack = async () => {
     const boundOnes = stagingImages.filter(img => img.binding);
     if (boundOnes.length === 0) { Alert.alert("提示", "请至少绑定一张卡牌后再导出"); return; }
 
+    // Check duplicates
+    const dupMap = getDupMap(stagingImages);
+    if (Object.keys(dupMap).length > 0) {
+      setShowDupModal(true);
+      return;
+    }
     setShowModInfo(true);
+  };
+
+  const handleDupResolve = (result) => {
+    setShowDupModal(false);
+    if (result === null) {
+      // All resolved — do nothing, user will press pack again
+      Alert.alert('解决完成', '所有冲突已解决，请再次点击封包按钮。');
+      return;
+    }
+    if (result === 'pack') {
+      // Proceed to pack
+      setShowModInfo(true);
+      return;
+    }
+    if (Array.isArray(result)) {
+      // result is [{index, keep}, ...]
+      const newImages = [...stagingImages];
+      result.forEach(({ index, keep }) => {
+        if (!keep) newImages[index] = { ...newImages[index], binding: null };
+      });
+      setStagingImages(newImages);
+    }
   };
 
   const doPack = async (finalModInfo) => {
@@ -431,102 +665,85 @@ export default function BindingScreen() {
     const boundOnes = stagingImages.filter(img => img.binding);
     if (boundOnes.length === 0) return;
 
+    // Re-check duplicates
+    const dupMap = getDupMap(stagingImages);
+    if (Object.keys(dupMap).length > 0) {
+      Alert.alert('仍有冲突', '还有未解决的重复绑定，请先处理。');
+      setShowDupModal(true);
+      return;
+    }
+
     setIsPacking(true);
     setModInfo(finalModInfo);
     try {
-      setPackStep('正在裁剪图片...');
-
-      // 1. Crop+resize each image to card dimensions using native manipulator
+      // 1. Process each image: crop to ratio, keep original resolution
+      setPackStep('正在处理图片...');
       const atlasCards = [];
       for (const img of boundOnes) {
         const binding = img.binding;
         const originalCard = cardsData.find(c => c.id === binding.cardId && c.cat === binding.cardCat);
         if (!originalCard) throw new Error(`找不到卡牌: ${binding.cardName}`);
         const card = resolveNormalCard(originalCard, cardsData);
-        const relpath = resolveTresRelPath(card);
-        if (!relpath) throw new Error(`无法解析卡牌路径: ${card.name}`);
+        const catPath = card.cat.replace(/ \/ /g, '/');
+        if (catPath === '未分类') throw new Error(`无法解析卡牌分类: ${card.name}`);
+        const relpath = `${catPath}/${card.name}.tres`;
 
         // Get image dimensions
         const imgInfo = await new Promise((resolve, reject) => {
           Image.getSize(img.uri, (w, h) => resolve({ w, h }), reject);
         });
 
-        // Calculate crop and resize to card dimensions
-        const crop = calculateCrop(imgInfo.w, imgInfo.h, card.w, card.h, binding.transform || { x:0, y:0, scale:1 });
-        // Clamp crop to image bounds
-        const cx = Math.max(0, crop.originX);
-        const cy = Math.max(0, crop.originY);
-        const cw = Math.min(crop.width, imgInfo.w - cx);
-        const ch = Math.min(crop.height, imgInfo.h - cy);
+        // Crop to match card ratio, keeping original resolution
+        const targetRatio = card.w / card.h;
+        const imgRatio = imgInfo.w / imgInfo.h;
+        let cropOriginX = 0, cropOriginY = 0, cropW = imgInfo.w, cropH = imgInfo.h;
+        if (Math.abs(imgRatio - targetRatio) > 0.005) {
+          if (imgRatio > targetRatio) {
+            cropW = Math.round(imgInfo.h * targetRatio);
+            cropOriginX = Math.round((imgInfo.w - cropW) / 2);
+            cropH = imgInfo.h;
+          } else {
+            cropH = Math.round(imgInfo.w / targetRatio);
+            cropOriginY = Math.round((imgInfo.h - cropH) / 2);
+            cropW = imgInfo.w;
+          }
+        }
+        // Clamp to image bounds
+        cropOriginX = Math.max(0, cropOriginX);
+        cropOriginY = Math.max(0, cropOriginY);
+        cropW = Math.min(cropW, imgInfo.w - cropOriginX);
+        cropH = Math.min(cropH, imgInfo.h - cropOriginY);
 
         const manipResult = await ImageManipulator.manipulateAsync(
           img.uri,
-          [{ crop: { originX: cx, originY: cy, width: cw, height: ch } }, { resize: { width: card.w, height: card.h } }],
+          [{ crop: { originX: cropOriginX, originY: cropOriginY, width: cropW, height: cropH } }],
           { format: ImageManipulator.SaveFormat.PNG }
         );
 
         const pngBase64 = await FileSystem.readAsStringAsync(manipResult.uri, { encoding: 'base64' });
         await FileSystem.deleteAsync(manipResult.uri, { idempotent: true });
 
-        atlasCards.push({ imageBase64: pngBase64, card, relpath, binding });
+        // Get actual cropped dimensions
+        const croppedW = cropW;
+        const croppedH = cropH;
+
+        atlasCards.push({
+          imageBase64: pngBase64,
+          card,
+          relpath,
+          catPath,
+          binding,
+          imgW: croppedW,
+          imgH: croppedH
+        });
       }
 
-      // 2. Build atlas grid
-      const COLS = 5, GAP = 1;
-      const cardW = Math.max(...atlasCards.map(c => c.card.w));
-      const cardH = Math.max(...atlasCards.map(c => c.card.h));
-      const rows = Math.ceil(atlasCards.length / COLS);
-      const totalW = COLS * cardW + (COLS - 1) * GAP;
-      const totalH = rows * cardH + (rows - 1) * GAP;
-      const PAD = 4; // padding around each card slot to avoid edge bleeding
-      const padW = cardW + PAD * 2;
-      const padH = cardH + PAD * 2;
-      const padTotalW = COLS * padW + (COLS - 1) * GAP;
-      const padTotalH = rows * padH + (rows - 1) * GAP;
+      setPackStep('正在生成文件...');
 
-      const atlasName = `modcard_atlas_${finalModInfo.pckName}.png`;
-      const atlasSp = `res://ArtWorks/Atlas/${atlasName}`;
-      const atlasUid = generateUid(atlasSp);
-
-      // Position cards on atlas grid (with padding offset)
-      const positionedCards = atlasCards.map((c, i) => {
-        const col = i % COLS;
-        const row = Math.floor(i / COLS);
-        return { ...c, px: col * padW + PAD, py: row * padH + PAD };
-      });
-
-      setPackStep('正在构建图集...');
-
-      // 3. Composite atlas via WebView canvas (simple paste, no transform needed)
-      const atlasBase64 = await new Promise((resolve, reject) => {
-        canvasCallbackRef.current = (data) => {
-          canvasCallbackRef.current = null;
-          resolve(data.atlasBase64);
-        };
-        const cardsForCanvas = positionedCards.map(c => ({
-          imageBase64: c.imageBase64,
-          x: c.px, y: c.py,
-          w: c.card.w, h: c.card.h
-        }));
-        packerEngineRef.current.buildLightAtlas(padTotalW, padTotalH, cardsForCanvas);
-        setTimeout(() => { if (canvasCallbackRef.current) { canvasCallbackRef.current = null; reject(new Error('Atlas build timeout')); } }, 30000);
-      });
-
-      setPackStep('正在转换图集...');
-
-      // 4. Convert to WebP → CTEX
-      const tempPngPath = FileSystem.cacheDirectory + 'temp_atlas.png';
-      await FileSystem.writeAsStringAsync(tempPngPath, atlasBase64, { encoding: 'base64' });
-      const webpResult = await ImageManipulator.manipulateAsync(tempPngPath, [], { format: ImageManipulator.SaveFormat.WEBP, compress: 1.0 });
-      const webpBase64 = await FileSystem.readAsStringAsync(webpResult.uri, { encoding: 'base64' });
-      const webpBytes = decodeBase64(webpBase64);
-      await FileSystem.deleteAsync(tempPngPath, { idempotent: true });
-      await FileSystem.deleteAsync(webpResult.uri, { idempotent: true });
-
-      setPackStep('正在生成资源...');
-
-      // 5. Build PCK files
       const filesInfo = [];
+      const uidCacheCards = [];
+
+      // Manifest
       const manifestStr = JSON.stringify({
         id: finalModInfo.pckName, name: finalModInfo.modName,
         author: finalModInfo.author, description: finalModInfo.desc,
@@ -536,22 +753,36 @@ export default function BindingScreen() {
       for (let i = 0; i < manifestStr.length; i++) manifestBytes[i] = manifestStr.charCodeAt(i);
       filesInfo.push({ godot_path: 'res://mod_manifest.json', data: manifestBytes });
 
-      const cfgStr = 'list=[]\n';
-      const cfgBytes = new Uint8Array(cfgStr.length);
-      for (let i = 0; i < cfgStr.length; i++) cfgBytes[i] = cfgStr.charCodeAt(i);
+      const cfgBytes = new Uint8Array(8);
+      for (let i = 0; i < 8; i++) cfgBytes[i] = 'list=[]\n'.charCodeAt(i);
       filesInfo.push({ godot_path: 'res://.godot/global_script_class_cache.cfg', data: cfgBytes });
 
-      const importText = generateImportText(atlasName, atlasUid);
-      const importBytes = new Uint8Array(importText.length);
-      for (let i = 0; i < importText.length; i++) importBytes[i] = importText.charCodeAt(i);
-      filesInfo.push({ godot_path: `res://ArtWorks/Atlas/${atlasName}.import`, data: importBytes });
+      for (const c of atlasCards) {
+        // Convert PNG base64 to WebP bytes — use ImageManipulator to get WebP
+        const tempPngPath = FileSystem.cacheDirectory + 'temp_card.png';
+        await FileSystem.writeAsStringAsync(tempPngPath, c.imageBase64, { encoding: 'base64' });
+        const webpResult = await ImageManipulator.manipulateAsync(tempPngPath, [], { format: ImageManipulator.SaveFormat.WEBP, compress: 1.0 });
+        const webpBase64 = await FileSystem.readAsStringAsync(webpResult.uri, { encoding: 'base64' });
+        const webpBytes = decodeBase64(webpBase64);
+        await FileSystem.deleteAsync(tempPngPath, { idempotent: true });
+        await FileSystem.deleteAsync(webpResult.uri, { idempotent: true });
 
-      const ctexBytes = createCtexBuffer(padTotalW, padTotalH, webpBytes);
-      const ctexHash = SparkMD5.hash(atlasSp);
-      filesInfo.push({ godot_path: `res://.godot/imported/${atlasName}-${ctexHash}.ctex`, data: ctexBytes });
+        // PNG reference path
+        const relPng = `res://images/packed/card_portraits/${c.catPath}/${c.card.name}.png`;
+        const pngUid = generateUid(relPng);
+        const ctexData = createCtexBuffer(c.imgW, c.imgH, webpBytes);
+        const ctexHash = SparkMD5.hash(relPng);
 
-      const uidCacheCards = [];
-      for (const c of positionedCards) {
+        // .png.import
+        const impText = generatePngImport(c.card.name, relPng, pngUid, ctexHash);
+        const impBytes = new Uint8Array(impText.length);
+        for (let i = 0; i < impText.length; i++) impBytes[i] = impText.charCodeAt(i);
+        filesInfo.push({ godot_path: `res://images/packed/card_portraits/${c.catPath}/${c.card.name}.png.import`, data: impBytes });
+
+        // .ctex
+        filesInfo.push({ godot_path: `res://.godot/imported/${c.card.name}.png-${ctexHash}.ctex`, data: ctexData });
+
+        // .tres.remap
         const tresSp = `res://images/atlases/card_atlas.sprites/${c.relpath}`;
         const hashHex = SparkMD5.hash(tresSp);
         const remapText = generateTresRemap(hashHex, c.card.name);
@@ -559,20 +790,23 @@ export default function BindingScreen() {
         for (let i = 0; i < remapText.length; i++) remapBytes[i] = remapText.charCodeAt(i);
         filesInfo.push({ godot_path: `res://images/atlases/card_atlas.sprites/${c.relpath}.remap`, data: remapBytes });
 
+        // .res (references individual PNG, region=(0,0,w,h))
         const tresUid = generateUid(tresSp);
-        const tresText = generateTresFile(atlasSp, tresUid, c.px, c.py, c.card.w, c.card.h);
+        const tresText = generateTresContent(relPng, tresUid, 0, 0, c.imgW, c.imgH);
         const tresBytes = new Uint8Array(tresText.length);
         for (let i = 0; i < tresText.length; i++) tresBytes[i] = tresText.charCodeAt(i);
-        filesInfo.push({ godot_path: `res://ArtWorks/Atlas/mod/${hashHex}-${c.card.name}.tres`, data: tresBytes });
+        filesInfo.push({ godot_path: `res://.godot/exported/133200997/export-${hashHex}-${c.card.name}.res`, data: tresBytes });
 
         uidCacheCards.push({ card: c.card, relpath: c.relpath });
       }
+
+      // uid_cache.bin
       const uidBin = buildUidCacheBin(uidCacheCards);
       filesInfo.push({ godot_path: 'res://.godot/uid_cache.bin', data: uidBin });
 
       setPackStep('正在打包...');
 
-      // 6. Create PCK + ZIP
+      // Create PCK + ZIP
       const pckBuffer = createPckBuffer(filesInfo);
       const zip = new JSZip();
       zip.file(`${finalModInfo.pckName}/${finalModInfo.pckName}.json`, manifestStr);
@@ -585,8 +819,7 @@ export default function BindingScreen() {
       await FileSystem.makeDirectoryAsync(fullOutputFolder, { intermediates: true });
       await FileSystem.writeAsStringAsync(fullOutputFolder + `${finalModInfo.pckName}.zip`, zipBase64, { encoding: 'base64' });
 
-      // Save history
-      await saveHistory(finalModInfo.pckName, finalModInfo, stagingImages, cardsData);
+      await saveHistory(finalModInfo.pckName, finalModInfo, stagingImages);
 
       setIsPacking(false);
       setPackStep('');
@@ -598,15 +831,14 @@ export default function BindingScreen() {
     }
   };
 
+  // --- History ---
   const handleRestoreHistory = async (record) => {
     if (stagingImages.length > 0) {
       Alert.alert('确认', '当前待处理区不为空，恢复历史将覆盖当前内容。是否继续？', [
         { text: '取消', style: 'cancel' },
         { text: '恢复', onPress: () => doRestore(record) }
       ]);
-    } else {
-      doRestore(record);
-    }
+    } else { doRestore(record); }
   };
 
   const doRestore = async (record) => {
@@ -615,17 +847,13 @@ export default function BindingScreen() {
       for (const b of (record.bindings || [])) {
         const uri = b.historyUri || b.uri;
         const info = await FileSystem.getInfoAsync(uri);
-        if (info.exists) {
-          restored.push({ uri, name: b.name, binding: b.binding });
-        }
+        if (info.exists) restored.push({ uri, name: b.name, binding: b.binding });
       }
       setStagingImages(restored);
       if (record.modInfo) setModInfo(record.modInfo);
       setShowHistory(false);
       Alert.alert('恢复成功', `已恢复 ${restored.length} 张图片及其绑定关系`);
-    } catch (e) {
-      Alert.alert('恢复失败', e.message);
-    }
+    } catch (e) { Alert.alert('恢复失败', e.message); }
   };
 
   const handleDeleteHistory = async (id) => {
@@ -644,52 +872,53 @@ export default function BindingScreen() {
     setShowHistory(true);
   };
 
-  const renderItem = ({ item }) => {
+  // --- Render ---
+  const dupMap = getDupMap(stagingImages);
+  const dupIndices = new Set();
+  Object.values(dupMap).forEach(arr => arr.forEach(i => dupIndices.add(i)));
+
+  const renderItem = ({ item, index }) => {
     const isSelected = selectedUris.has(item.uri);
+    const isDup = dupIndices.has(index);
     return (
-    <TouchableOpacity
-      style={[styles.imageCard, isSelected && styles.selectedCard]}
-      onPress={multiSelectMode ? () => toggleSelectUri(item.uri) : undefined}
-      onLongPress={() => {
-        if (!multiSelectMode) {
-          setMultiSelectMode(true);
-          setSelectedUris(new Set([item.uri]));
-        }
-      }}
-      activeOpacity={multiSelectMode ? 0.7 : 1}
-    >
-      {multiSelectMode && (
-        <Ionicons
-          name={isSelected ? 'checkmark-circle' : 'ellipse-outline'}
-          size={24}
-          color="#F4A8B6"
-          style={{ marginRight: 10 }}
-        />
-      )}
-      <Image source={{ uri: item.uri }} style={styles.thumbnail} />
-      <View style={styles.cardInfo}>
-        <Text style={styles.fileName} numberOfLines={1}>{item.name}</Text>
-        {item.binding ? (
-          <View style={styles.bindingInfo}>
-            <Ionicons name="link" size={14} color="#A3D9A5" />
-            <Text style={styles.bindingText}>已绑定: {item.binding.cardName}{item.binding.isBeta ? ' (Beta)' : ''}</Text>
-          </View>
-        ) : (
-          <Text style={styles.unboundText}>未绑定关系</Text>
+      <TouchableOpacity
+        style={[styles.imageCard, isSelected && styles.selectedCard]}
+        onPress={multiSelectMode ? () => toggleSelectUri(item.uri) : undefined}
+        onLongPress={() => { if (!multiSelectMode) { setMultiSelectMode(true); setSelectedUris(new Set([item.uri])); } }}
+        activeOpacity={multiSelectMode ? 0.7 : 1}
+      >
+        {multiSelectMode && (
+          <Ionicons name={isSelected ? 'checkmark-circle' : 'ellipse-outline'} size={24} color="#F4A8B6" style={{ marginRight: 10 }} />
         )}
-      </View>
-      {!multiSelectMode && (
-        <View style={styles.actions}>
-          <TouchableOpacity onPress={() => handleOpenCropper(item)} style={styles.actionBtn}>
-            <Ionicons name="crop" size={24} color="#F4A8B6" />
-          </TouchableOpacity>
-          <TouchableOpacity onPress={() => removeImageFromStaging(item.uri)} style={styles.actionBtn}>
-            <Ionicons name="trash-outline" size={24} color="#8A7E81" />
-          </TouchableOpacity>
+        <Image source={{ uri: item.uri }} style={styles.thumbnail} />
+        <View style={styles.cardInfo}>
+          <Text style={[styles.fileName, isDup && styles.dupFileName]} numberOfLines={1}>
+            {isDup ? '⚠️ ' : ''}{item.name}
+          </Text>
+          {item.binding ? (
+            <View style={styles.bindingInfo}>
+              <Ionicons name="link" size={14} color={isDup ? '#F2C78A' : '#A3D9A5'} />
+              <Text style={[styles.bindingText, isDup && { color: '#F2C78A' }]}>
+                已绑定: {item.binding.cardName}{item.binding.isBeta ? ' (Beta)' : ''}
+              </Text>
+            </View>
+          ) : (
+            <Text style={styles.unboundText}>未绑定关系</Text>
+          )}
         </View>
-      )}
-    </TouchableOpacity>
-  );};
+        {!multiSelectMode && (
+          <View style={styles.actions}>
+            <TouchableOpacity onPress={() => handleOpenCropper(item)} style={styles.actionBtn}>
+              <Ionicons name="crop" size={24} color="#F4A8B6" />
+            </TouchableOpacity>
+            <TouchableOpacity onPress={() => removeImageFromStaging(item.uri)} style={styles.actionBtn}>
+              <Ionicons name="trash-outline" size={24} color="#8A7E81" />
+            </TouchableOpacity>
+          </View>
+        )}
+      </TouchableOpacity>
+    );
+  };
 
   return (
     <View style={styles.container}>
@@ -697,19 +926,12 @@ export default function BindingScreen() {
         <View style={styles.headerSide}>
           <TouchableOpacity
             style={{ padding: 5 }}
-            onPress={() => {
-              setMultiSelectMode(!multiSelectMode);
-              if (multiSelectMode) setSelectedUris(new Set());
-            }}
+            onPress={() => { setMultiSelectMode(!multiSelectMode); if (multiSelectMode) setSelectedUris(new Set()); }}
           >
-            <Ionicons
-              name={multiSelectMode ? 'checkmark-circle' : 'checkmark-circle-outline'}
-              size={26}
-              color="#F4A8B6"
-            />
+            <Ionicons name={multiSelectMode ? 'checkmark-circle' : 'checkmark-circle-outline'} size={26} color="#F4A8B6" />
           </TouchableOpacity>
         </View>
-        <Text style={styles.headerTitle}>关系绑定与封包 (轻量模式)</Text>
+        <Text style={styles.headerTitle}>关系绑定与封包 (独立卡图模式)</Text>
         <View style={styles.headerSide}>
           <TouchableOpacity onPress={handleOpenHistory}>
             <Ionicons name="time-outline" size={24} color="#F4A8B6" />
@@ -759,7 +981,7 @@ export default function BindingScreen() {
         onPress={autoBindAll}
         disabled={stagingImages.length === 0}
       >
-        <Text style={styles.autoBindBtnText}>🤖 自动绑定</Text>
+        <Text style={styles.autoBindBtnText}>自动绑定</Text>
       </TouchableOpacity>
 
       <TouchableOpacity
@@ -767,16 +989,10 @@ export default function BindingScreen() {
         onPress={handleStartPack}
         disabled={isPacking || stagingImages.length === 0}
       >
-        {isPacking ? <ActivityIndicator color="#FFF" /> : <Text style={styles.packBtnText}>🚀 导出并封包</Text>}
+        {isPacking ? <ActivityIndicator color="#FFF" /> : <Text style={styles.packBtnText}>导出并封包</Text>}
       </TouchableOpacity>
 
-      <PackerEngine
-        ref={packerEngineRef}
-        onProcessingComplete={() => {}}
-        onLightAtlasReady={(data) => {
-          if (canvasCallbackRef.current) canvasCallbackRef.current(data);
-        }}
-      />
+      <PackerEngine ref={packerEngineRef} onProcessingComplete={() => {}} onLightAtlasReady={() => {}} />
 
       {selectedImage && (
         <CropperModal
@@ -790,20 +1006,11 @@ export default function BindingScreen() {
         />
       )}
 
-      <ModInfoModal
-        visible={showModInfo}
-        initial={modInfo}
-        onClose={() => setShowModInfo(false)}
-        onConfirm={doPack}
-      />
+      <ModInfoModal visible={showModInfo} initial={modInfo} onClose={() => setShowModInfo(false)} onConfirm={doPack} />
 
-      <HistoryModal
-        visible={showHistory}
-        records={historyRecords}
-        onClose={() => setShowHistory(false)}
-        onRestore={handleRestoreHistory}
-        onDelete={handleDeleteHistory}
-      />
+      <HistoryModal visible={showHistory} records={historyRecords} onClose={() => setShowHistory(false)} onRestore={handleRestoreHistory} onDelete={handleDeleteHistory} />
+
+      <DuplicateBindingModal visible={showDupModal} stagingImages={stagingImages} cardsData={cardsData} onResolve={handleDupResolve} onCancel={() => setShowDupModal(false)} />
     </View>
   );
 }
@@ -811,13 +1018,8 @@ export default function BindingScreen() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#FDF6F9' },
   header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: 15,
-    backgroundColor: '#FFFFFF',
-    borderBottomWidth: 1,
-    borderBottomColor: '#F2E1E6'
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+    paddingVertical: 15, backgroundColor: '#FFFFFF', borderBottomWidth: 1, borderBottomColor: '#F2E1E6'
   },
   headerTitle: { fontSize: 18, fontWeight: 'bold', color: '#4A4043', flex: 1, textAlign: 'center' },
   headerSide: { width: 44, alignItems: 'center', justifyContent: 'center' },
@@ -828,6 +1030,7 @@ const styles = StyleSheet.create({
   thumbnail: { width: 60, height: 60, borderRadius: 8, backgroundColor: '#EEE' },
   cardInfo: { flex: 1, marginLeft: 15 },
   fileName: { fontSize: 16, fontWeight: '600', color: '#4A4043' },
+  dupFileName: { color: '#F2C78A' },
   unboundText: { fontSize: 13, color: '#8A7E81', marginTop: 4 },
   bindingInfo: { flexDirection: 'row', alignItems: 'center', marginTop: 4 },
   bindingText: { fontSize: 13, color: '#A3D9A5', marginLeft: 4, fontWeight: 'bold' },
@@ -836,10 +1039,7 @@ const styles = StyleSheet.create({
   emptyContainer: { alignItems: 'center', marginTop: 100, paddingHorizontal: 40 },
   emptyText: { fontSize: 18, color: '#8A7E81', marginTop: 20, fontWeight: 'bold' },
   emptySubText: { fontSize: 14, color: '#D1D1D1', marginTop: 10, textAlign: 'center' },
-  packingOverlay: {
-    position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
-    backgroundColor: 'rgba(0,0,0,0.3)', justifyContent: 'center', alignItems: 'center', zIndex: 100
-  },
+  packingOverlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.3)', justifyContent: 'center', alignItems: 'center', zIndex: 100 },
   packingText: { color: '#FFF', marginTop: 10, fontSize: 16 },
   autoBindBtn: {
     backgroundColor: '#F4A8B6', marginHorizontal: 20, marginTop: 10, padding: 14, borderRadius: 15, alignItems: 'center',
@@ -852,13 +1052,10 @@ const styles = StyleSheet.create({
   },
   packBtnDisabled: { backgroundColor: '#D1D1D1' },
   packBtnText: { color: '#FFF', fontSize: 18, fontWeight: 'bold' },
-  multiSelectBar: {
-    flexDirection: 'row', alignItems: 'center', padding: 10, backgroundColor: '#F2E1E6', paddingHorizontal: 15
-  },
+  multiSelectBar: { flexDirection: 'row', alignItems: 'center', padding: 10, backgroundColor: '#F2E1E6', paddingHorizontal: 15 },
   multiSelectBtn: { marginRight: 20, padding: 5 },
   multiSelectBtnText: { color: '#4A4043', fontWeight: 'bold', fontSize: 14 },
   selectedCard: { backgroundColor: '#FDE2E8' },
-  // Modal styles
   modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', padding: 30 },
   modalContent: { backgroundColor: '#FFF', borderRadius: 15, padding: 20, maxHeight: '60%' },
   modalTitle: { fontSize: 20, fontWeight: 'bold', color: '#4A4043', marginBottom: 15 },
@@ -870,7 +1067,6 @@ const styles = StyleSheet.create({
   modalBtnCancelText: { color: '#8A7E81', fontSize: 16 },
   modalBtnOk: { backgroundColor: '#A3D9A5', paddingHorizontal: 20, paddingVertical: 10, borderRadius: 8 },
   modalBtnOkText: { color: '#FFF', fontSize: 16, fontWeight: 'bold' },
-  // History styles
   historyItem: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#F2E1E6' },
   historyInfo: { flex: 1 },
   historyTime: { fontSize: 14, fontWeight: '600', color: '#4A4043' },
