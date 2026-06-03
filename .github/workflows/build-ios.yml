@@ -56,11 +56,16 @@ jobs:
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
+            -arch arm64 \
+            ONLY_ACTIVE_ARCH=NO \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            DEAD_CODE_STRIPPING=NO \
+            STRIP_INSTALLED_PRODUCT=NO \
+            GCC_SYMBOLS_PRIVATE_EXTERN=NO \
             clean build
 
       - name: Package IPA
@@ -75,9 +80,14 @@ jobs:
           
           echo "Found App at: $APP_PATH"
           
+          # 对内部的所有动态库和主程序进行 Ad-Hoc 伪签名占位
+          find "$APP_PATH" -type d -name "*.framework" -exec codesign --force --sign - --timestamp=none {} \;
+          find "$APP_PATH" -name "*.dylib" -exec codesign --force --sign - --timestamp=none {} \;
+          codesign --force --sign - --timestamp=none "$APP_PATH"
+          
           mkdir -p Payload
           cp -r "$APP_PATH" Payload/
-          zip -r CardPacker_Sideload.ipa Payload
+          zip -q -r CardPacker_Sideload.ipa Payload
           
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
