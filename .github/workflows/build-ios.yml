@@ -1,17 +1,18 @@
 name: Build iOS IPA (Sideload Ready)
 
 on:
-  workflow_dispatch: 
+  workflow_dispatch:
     inputs:
       remarks:
         description: '构建说明 (可选)'
         required: false
         default: 'Manual Build'
-        
+
 jobs:
   build:
     name: Build Unsigned IPA
-    runs-on: macos-latest
+    runs-on: macos-15
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -19,75 +20,123 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 20
           cache: 'npm'
           cache-dependency-path: Sts2ModPacker/package-lock.json
 
       - name: Install dependencies
         run: |
           cd Sts2ModPacker
-          npm install
+          npm ci
+
+      - name: Install expo-build-properties
+        run: |
+          cd Sts2ModPacker
+          npx expo install expo-build-properties
+
+      - name: Force React Native build from source
+        run: |
+          cd Sts2ModPacker
+          node - <<'NODE'
+          const fs = require('fs');
+
+          const candidates = ['app.json', 'app.config.json'];
+          const file = candidates.find(f => fs.existsSync(f));
+
+          if (!file) {
+            console.error('No app.json or app.config.json found. Please configure expo-build-properties manually.');
+            process.exit(1);
+          }
+
+          const json = JSON.parse(fs.readFileSync(file, 'utf8'));
+          const expo = json.expo || json;
+
+          expo.plugins = expo.plugins || [];
+
+          const pluginName = 'expo-build-properties';
+          const existingIndex = expo.plugins.findIndex(p =>
+            p === pluginName || (Array.isArray(p) && p[0] === pluginName)
+          );
+
+          const pluginConfig = [
+            pluginName,
+            {
+              ios: {
+                buildReactNativeFromSource: true
+              }
+            }
+          ];
+
+          if (existingIndex >= 0) {
+            expo.plugins[existingIndex] = pluginConfig;
+          } else {
+            expo.plugins.push(pluginConfig);
+          }
+
+          if (json.expo) {
+            json.expo = expo;
+          }
+
+          fs.writeFileSync(file, JSON.stringify(json, null, 2));
+          console.log(`Updated ${file}`);
+          NODE
+
+      - name: Clean generated native files
+        run: |
+          cd Sts2ModPacker
+          rm -rf ios
+          rm -rf node_modules/.cache
+          rm -rf ~/Library/Developer/Xcode/DerivedData
 
       - name: Prebuild iOS project
         run: |
           cd Sts2ModPacker
-          npx expo prebuild --platform ios --no-install
+          npx expo prebuild --platform ios --clean --no-install
 
       - name: Install CocoaPods
         run: |
           cd Sts2ModPacker/ios
-          pod install
+          pod install --repo-update
 
       - name: Build Unsigned App
         run: |
           cd Sts2ModPacker/ios
-          # Debug: list generated files
-          ls -F
           
-          # Auto-detect Workspace and Scheme
           WORKSPACE=$(ls -d *.xcworkspace | head -n 1)
           SCHEME=$(ls -d *.xcodeproj | sed 's/\.xcodeproj//' | head -n 1)
           
           echo "Found Workspace: $WORKSPACE"
           echo "Found Scheme: $SCHEME"
-          
+
           xcodebuild -workspace "$WORKSPACE" \
             -scheme "$SCHEME" \
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
-            ONLY_ACTIVE_ARCH=NO \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             AD_HOC_CODE_SIGNING_ALLOWED=YES \
-            DEAD_CODE_STRIPPING=NO \
-            STRIP_INSTALLED_PRODUCT=NO \
-            GCC_SYMBOLS_PRIVATE_EXTERN=NO \
             clean build
 
       - name: Package IPA
         run: |
-          # The .app usually ends up in build/Build/Products/Release-iphoneos/
-          APP_PATH=$(find Sts2ModPacker/ios/build -name "*.app" -type d | head -n 1)
-          
+          APP_PATH=$(find Sts2ModPacker/ios/build/Build/Products/Release-iphoneos -name "*.app" -type d | head -n 1)
+
           if [ -z "$APP_PATH" ]; then
             echo "Error: Could not find .app file!"
+            find Sts2ModPacker/ios/build -name "*.app" -type d
             exit 1
           fi
-          
+
           echo "Found App at: $APP_PATH"
-          
-          # 对内部的所有动态库和主程序进行 Ad-Hoc 伪签名占位
-          find "$APP_PATH" -type d -name "*.framework" -exec codesign --force --sign - --timestamp=none {} \;
-          find "$APP_PATH" -name "*.dylib" -exec codesign --force --sign - --timestamp=none {} \;
-          codesign --force --sign - --timestamp=none "$APP_PATH"
-          
+
+          rm -rf Payload
           mkdir -p Payload
-          cp -r "$APP_PATH" Payload/
-          zip -q -r CardPacker_Sideload.ipa Payload
-          
+          cp -R "$APP_PATH" Payload/
+          zip -qry CardPacker_Sideload.ipa Payload
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
